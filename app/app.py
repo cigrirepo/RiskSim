@@ -23,7 +23,8 @@ def init_openai():
     key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
     if not key:
         st.error(
-            "OpenAI API key not found. Set OPENAI_API_KEY in environment or in Streamlit secrets."
+            "OpenAI API key not found. "
+            "Set OPENAI_API_KEY in environment or in Streamlit secrets."
         )
     else:
         openai.api_key = key
@@ -167,10 +168,16 @@ def generate_risk_mermaid(drivers: list[str]) -> str:
     """
     Build a Mermaid flowchart snippet connecting each driver to a single outcome node.
     """
-    lines = [f"    node{i}[{d}]" for i, d in enumerate(drivers, 1)]
-    lines.append("    Outcome((Net Present Value))")
-    lines += [f"    node{i} --> Outcome" for i in range(1, len(drivers) + 1)]
-    return "```mermaid\nflowchart LR\n" + "\n".join(lines) + "\n```"
+    nodes = [f"    node{i}[{d}]" for i, d in enumerate(drivers, 1)]
+    arrows = [f"    node{i} --> Outcome" for i in range(1, len(drivers) + 1)]
+    return (
+        "```mermaid\n"
+        "flowchart LR\n"
+        + "\n".join(nodes)
+        + "\n    Outcome((Net Present Value))\n"
+        + "\n".join(arrows)
+        + "\n```"
+    )
 
 
 def generate_narrative(findings: dict) -> str:
@@ -182,7 +189,7 @@ def generate_narrative(findings: dict) -> str:
         + json.dumps(findings, indent=2)
     )
     try:
-        resp = openai.chat.completions.create(
+        resp = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=200,
@@ -274,7 +281,8 @@ def main():
     df_upload = None
     if uploaded:
         try:
-            df_upload = (pd.read_csv(uploaded) if uploaded.name.lower().endswith(".csv") else pd.read_excel(uploaded))
+            df_upload = (pd.read_csv(uploaded) if uploaded.name.lower().endswith(".csv")
+                         else pd.read_excel(uploaded))
             st.sidebar.success("Assumptions file loaded.")
         except Exception as e:
             st.sidebar.error(f"Failed to load file: {e}")
@@ -282,12 +290,12 @@ def main():
     # -- Free-Text Parser --
     free_text = st.sidebar.text_area("Or paste assumption text...", height=100)
     if st.sidebar.button("Parse Free-Text") and free_text:
-        prompt_text = ("Parse the following financial assumptions into JSON...\n" + free_text)
-        resp = openai.chat.completions.create(
+        prompt_text = "Parse the following financial assumptions into JSON...\n" + free_text
+        resp = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt_text}],
             max_tokens=300,
-            temperature=0
+            temperature=0,
         )
         raw = resp.choices[0].message.content.strip()
         m = re.search(r"```(?:json)?(.*?)```", raw, re.S)
@@ -315,8 +323,10 @@ def main():
     selected = st.sidebar.selectbox("Select Scenario", scenarios) if scenarios else None
 
     # -- Simulation Settings --
-    n_sims = st.sidebar.number_input("Number of Simulations", min_value=1000, max_value=100000, value=20000, step=1000)
-    discount_rate = st.sidebar.number_input("Discount Rate", min_value=0.0, max_value=1.0, value=0.1, step=0.01)
+    n_sims = st.sidebar.number_input("Number of Simulations", min_value=1000,
+                                     max_value=100000, value=20000, step=1000)
+    discount_rate = st.sidebar.number_input("Discount Rate", min_value=0.0,
+                                            max_value=1.0, value=0.1, step=0.01)
 
     # -- Correlation Matrix --
     corr_matrix = None
@@ -325,19 +335,20 @@ def main():
         try:
             corr_df = pd.read_csv(uploaded_corr, index_col=0)
             if corr_df.shape[0] != corr_df.shape[1] or list(corr_df.columns) != list(corr_df.index):
-                raise ValueError
+                raise ValueError("Matrix must be square with matching labels.")
             if np.any(np.linalg.eigvals(corr_df) < 0):
-                raise ValueError
+                raise ValueError("Matrix is not positive semidef.")
             corr_matrix = corr_df.values
             st.sidebar.success("Correlation matrix loaded.")
         except Exception as e:
             st.sidebar.error(f"Invalid correlation matrix: {e}")
 
-    # -- Run Simulation --
+    # ── Run Simulation ────────────────────────────────────────────────────────────
     if selected and st.sidebar.button("Run Simulation"):
         df_assump = st.session_state["scenarios"][selected]
         assumptions = parse_assumptions_df(df_assump)
         sim_df = run_monte_carlo(assumptions, int(n_sims), corr_matrix)
+
         drivers = [a["driver"] for a in assumptions]
         npv_arr = calculate_npv(sim_df, drivers, discount_rate)
         var, cvar = calculate_var_cvar(npv_arr)
@@ -346,21 +357,29 @@ def main():
         st.subheader(f"Scenario: {selected}")
         histfig = px.histogram(npv_arr, nbins=50, title="NPV Distribution")
         st.plotly_chart(histfig, use_container_width=True)
+
         impacts = []
         for d in drivers:
             pert = sim_df.copy()
             pert[d] += sim_df[d].std()
-            impacts.append({"Driver": d, "Impact": calculate_npv(pert, drivers, discount_rate).mean() - base_npv})
+            impacts.append({
+                "Driver": d,
+                "Impact": calculate_npv(pert, drivers, discount_rate).mean() - base_npv,
+            })
         tor_df = pd.DataFrame(impacts)
         tor_fig = tornado_chart(tor_df)
         st.plotly_chart(tor_fig, use_container_width=True)
 
-        st.markdown(f"**VaR (5%):** ${var:,.2f}   **CVaR:** ${cvar:,.2f}   **P(NPV<0):** {(npv_arr<0).mean()*100:.2f}%")
+        st.markdown(
+            f"**VaR (5%):** ${var:,.2f}   "
+            f"**CVaR:** ${cvar:,.2f}   "
+            f"**P(NPV<0):** {(npv_arr < 0).mean() * 100:.2f}%"
+        )
 
         st.markdown("### Risk Workflow Diagram")
         st.code(generate_risk_mermaid(drivers), language="markdown")
 
-        # Generate AI Narrative
+        # ── AI Narrative ────────────────────────────────────────────────────────
         if st.sidebar.button("Generate AI Narrative"):
             findings = {
                 "Scenario": selected,
@@ -368,7 +387,7 @@ def main():
                 "Std Dev": round(npv_arr.std(), 2),
                 "VaR(5%)": round(var, 2),
                 "CVaR": round(cvar, 2),
-                "P(NPV<0)": f"{(npv_arr<0).mean()*100:.2f}%"
+                "P(NPV<0)": f"{(npv_arr < 0).mean() * 100:.2f}%"
             }
             with st.spinner("Generating AI narrative..."):
                 narrative = generate_narrative(findings)
@@ -376,33 +395,31 @@ def main():
                 st.subheader("Executive Summary")
                 st.write(narrative)
 
-        # Interactive sliders
+        # ── What-If Sliders ─────────────────────────────────────────────────────
         st.markdown("### 🔁 Re-run With Adjusted Inputs")
         adj_vals = {}
         for d in drivers:
-            mean_val = sim_df[d].mean()
-            sd = sim_df[d].std()
-            if sd > 0:
-                low = float(mean_val - 2*sd)
-                high = float(mean_val + 2*sd)
-                step = float(sd/10)
-                adj_vals[d] = st.slider(d, low, high, float(mean_val), step=step)
+            m, s = sim_df[d].mean(), sim_df[d].std()
+            if s > 0:
+                adj_vals[d] = st.slider(d, float(m - 2*s), float(m + 2*s), float(m), step=float(s/10))
             else:
-                adj_vals[d] = st.number_input(f"{d} (constant)", value=float(mean_val))
+                adj_vals[d] = st.number_input(f"{d} (constant)", value=float(m))
         adj_df = pd.DataFrame([adj_vals])
         adj_npv = calculate_npv(adj_df, drivers, discount_rate)[0]
-        st.markdown(f"**Adjusted NPV:** ${adj_npv:,.2f}   **Δ:** ${adj_npv-base_npv:,.2f}")
+        st.markdown(f"**Adjusted NPV:** ${adj_npv:,.2f}   **Δ:** ${adj_npv - base_npv:,.2f}")
 
+        # ── Export Results ──────────────────────────────────────────────────────
         st.markdown("### Export Results")
         summary_dict = {
             "Mean NPV": f"${base_npv:,.2f}",
             "Std Dev": f"${npv_arr.std():,.2f}",
             "VaR(5%)": f"${var:,.2f}",
             "CVaR": f"${cvar:,.2f}",
-            "P(NPV<0)": f"{(npv_arr<0).mean()*100:.2f}%"
+            "P(NPV<0)": f"{(npv_arr < 0).mean() * 100:.2f}%"
         }
-        export_pdf(histfig, tor_fig, narrative, summary_dict)
+        export_pdf(histfig, tor_fig, narrative if 'narrative' in locals() else "", summary_dict)
         export_excel(sim_df, npv_arr, df_assump)
+
 
 if __name__ == "__main__":
     main()
