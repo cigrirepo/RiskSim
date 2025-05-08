@@ -1,1 +1,12 @@
-
+streamlit
+pandas
+numpy
+scipy
+plotly
+openai
+fpdf
+xlsxwriter
+numba
+python-docx
+request
+matplotlib
