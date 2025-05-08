@@ -183,10 +183,13 @@ def generate_narrative(findings: dict) -> str:
         "Write a concise executive summary of the following risk analysis results:\n"
         + json.dumps(findings, indent=2)
     )
-    resp = openai.Completion.create(
-        engine="text-davinci-003", prompt=prompt, max_tokens=200, temperature=0.5
+    resp = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=200,
+        temperature=0.5,
     )
-    text = resp.choices[0].text.strip()
+    text = resp.choices[0].message.content.strip()
 
     # Strip any code fences
     m = re.search(r"```(?:json)?(.*?)```", text, re.S)
@@ -300,10 +303,13 @@ def main():
             "params [three numbers]:\n"
             + free_text
         )
-        resp = openai.Completion.create(
-            engine="text-davinci-003", prompt=prompt, max_tokens=300, temperature=0
+        resp = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=300,
+            temperature=0,
         )
-        raw = resp.choices[0].text.strip()
+        raw = resp.choices[0].message.content.strip()
         m = re.search(r"```(?:json)?(.*?)```", raw, re.S)
         jstr = m.group(1).strip() if m else raw
         try:
