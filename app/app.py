@@ -1,185 +1,454 @@
+import os
+import re
+import json
+import tempfile
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-from scipy.stats import triang, norm, lognorm, uniform
+import scipy.stats as stats
+from scipy.linalg import cholesky
 import plotly.express as px
-import plotly.graph_objects as go
-import json
-# Optional: import numba for speed
-# from numba import njit
-
-# AI/NLP
 import openai
-
-# Exports
 from fpdf import FPDF
-import xlsxwriter
 
+# ── Page Configuration ────────────────────────────────────────────────────────
 st.set_page_config(page_title="RiskSim360", layout="wide")
 
-# ------------------------
-# Helper functions
-# ------------------------
-def parse_assumptions(df):
+
+def init_openai():
     """
-    Expect columns: ['Driver','Distribution','Param1','Param2','Param3']
-    e.g. Distribution: 'triangular','normal','lognormal','uniform'
-    Param: for triangular: (min, mode, max)
-           for normal: (mean, std)
+    Initialize OpenAI API key from env or Streamlit secrets.
+    """
+    key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
+    if not key:
+        st.error(
+            "OpenAI API key not found. "
+            "Set OPENAI_API_KEY in environment or in Streamlit secrets."
+        )
+    else:
+        openai.api_key = key
+
+
+init_openai()
+
+# ── Session State Initialization ──────────────────────────────────────────────
+if "scenarios" not in st.session_state:
+    st.session_state["scenarios"] = {}
+if "parsed_df" not in st.session_state:
+    st.session_state["parsed_df"] = None
+
+
+# ── Helper Functions ──────────────────────────────────────────────────────────
+def parse_assumptions_df(df: pd.DataFrame) -> list[dict]:
+    """
+    Convert a structured DataFrame into a list of assumption dicts.
+    Expects columns: ['Driver','Distribution','Param1','Param2','Param3'].
     """
     assumptions = []
     for _, row in df.iterrows():
-        driver = row['Driver']
-        dist = row['Distribution'].lower()
-        params = [row['Param1'], row['Param2'], row['Param3']]
-        assumptions.append({'driver': driver, 'dist': dist, 'params': params})
+        assumptions.append({
+            "driver": str(row["Driver"]),
+            "dist": str(row["Distribution"]).lower(),
+            "params": [
+                float(row["Param1"]),
+                float(row["Param2"]),
+                float(row["Param3"]),
+            ],
+        })
     return assumptions
 
-# @njit  # Optional speed-up
-def run_monte_carlo(assumptions, n_sims, correlation=None):
+
+def apply_correlation(n_sims: int, assumptions: list, corr_matrix: np.ndarray) -> np.ndarray:
     """
-    Run Monte Carlo sims. Return DataFrame of shape (n_sims, len(assumptions)).
+    Generate correlated standard normals via Cholesky decomposition.
     """
-    sims = np.zeros((n_sims, len(assumptions)))
+    L = cholesky(corr_matrix, lower=True)
+    z = np.random.standard_normal((n_sims, len(assumptions)))
+    return z @ L.T
+
+
+def sample_from_copula(corr_normals: np.ndarray, assumptions: list) -> np.ndarray:
+    """
+    Transform correlated normals to target distributions via inverse CDF.
+    """
+    samples = np.zeros_like(corr_normals)
     for i, a in enumerate(assumptions):
-        if a['dist']=='triangular':
-            c = (a['params'][1] - a['params'][0])/(a['params'][2]-a['params'][0])
-            sims[:,i] = triang(c, loc=a['params'][0], scale=(a['params'][2]-a['params'][0])).rvs(n_sims)
-        elif a['dist']=='normal':
-            sims[:,i] = norm(loc=a['params'][0], scale=a['params'][1]).rvs(n_sims)
-        elif a['dist']=='lognormal':
-            sims[:,i] = lognorm(s=a['params'][1], scale=np.exp(a['params'][0])).rvs(n_sims)
-        elif a['dist']=='uniform':
-            sims[:,i] = uniform(loc=a['params'][0], scale=(a['params'][1]-a['params'][0])).rvs(n_sims)
+        q = stats.norm.cdf(corr_normals[:, i])
+        mn, p2, p3 = a["params"]
+        dist = a["dist"]
+
+        if dist == "triangular":
+            mode, mx = p2, p3
+            c = (mode - mn) / (mx - mn)
+            samples[:, i] = stats.triang(c, loc=mn, scale=(mx - mn)).ppf(q)
+        elif dist == "normal":
+            samples[:, i] = stats.norm(loc=mn, scale=p2).ppf(q)
+        elif dist == "lognormal":
+            samples[:, i] = stats.lognorm(s=p2, scale=np.exp(mn)).ppf(q)
+        elif dist == "uniform":
+            samples[:, i] = stats.uniform(loc=mn, scale=(p2 - mn)).ppf(q)
         else:
-            sims[:,i] = np.nan
-    # TODO: handle correlation via Cholesky if provided
-    return pd.DataFrame(sims, columns=[a['driver'] for a in assumptions])
+            samples[:, i] = np.nan
+
+    return samples
 
 
-def calculate_npv(sim_df, cashflow_cols, discount_rate):
+def run_monte_carlo(
+    assumptions: list[dict],
+    n_sims: int,
+    corr_matrix: np.ndarray | None = None
+) -> pd.DataFrame:
     """
-    cashflow_cols: list of column names in sim_df representing CF t=0..T
-    discount_rate: scalar
+    Run Monte Carlo simulation, optionally applying input correlations.
+    Returns a DataFrame of shape (n_sims, num_drivers).
     """
-    # Present Value of each period
-    pv = sim_df[cashflow_cols].values / ((1+discount_rate) ** np.arange(len(cashflow_cols)))
+    if corr_matrix is not None:
+        corr_normals = apply_correlation(n_sims, assumptions, corr_matrix)
+        sims = sample_from_copula(corr_normals, assumptions)
+    else:
+        sims = np.zeros((n_sims, len(assumptions)))
+        for i, a in enumerate(assumptions):
+            mn, p2, p3 = a["params"]
+            dist = a["dist"]
+
+            if dist == "triangular":
+                mode, mx = p2, p3
+                c = (mode - mn) / (mx - mn)
+                sims[:, i] = stats.triang(c, loc=mn, scale=(mx - mn)).rvs(n_sims)
+            elif dist == "normal":
+                sims[:, i] = stats.norm(loc=mn, scale=p2).rvs(n_sims)
+            elif dist == "lognormal":
+                sims[:, i] = stats.lognorm(s=p2, scale=np.exp(mn)).rvs(n_sims)
+            elif dist == "uniform":
+                sims[:, i] = stats.uniform(loc=mn, scale=(p2 - mn)).rvs(n_sims)
+            else:
+                sims[:, i] = np.nan
+
+    cols = [a["driver"] for a in assumptions]
+    return pd.DataFrame(sims, columns=cols)
+
+
+def calculate_npv(
+    sim_df: pd.DataFrame,
+    cashflow_cols: list[str],
+    discount_rate: float
+) -> np.ndarray:
+    """
+    Calculate NPV for each simulation. Assumes cashflow_cols correspond
+    to t=0,1,... in order.
+    """
+    periods = np.arange(len(cashflow_cols))
+    pv = sim_df[cashflow_cols].values / ((1 + discount_rate) ** periods)
     return pv.sum(axis=1)
 
 
-def tornado_chart(impact_df):
+def calculate_var_cvar(npv_array: np.ndarray, alpha: float = 0.05) -> tuple[float, float]:
     """
-    Plot tornado chart given impact_df with columns ['Driver','Impact']
+    Compute Value-at-Risk and Conditional VaR at the alpha level.
     """
-    fig = px.bar(impact_df.sort_values('Impact'), x='Impact', y='Driver', orientation='h')
-    return fig
+    var = np.percentile(npv_array, alpha * 100)
+    cvar = npv_array[npv_array <= var].mean()
+    return var, cvar
 
 
-def generate_risk_mermaid(drivers):
+def tornado_chart(impact_df: pd.DataFrame) -> px.bar:
     """
-    Build Mermaid syntax for risk workflow to send to Flowwmaid.
-    e.g. drivers = ['Revenue Growth','COGS %','Discount Rate']
+    Generate a horizontal bar chart of driver impacts on NPV.
     """
-    nodes = '\n'.join([f"    {i+1}[{d}]" for i,d in enumerate(drivers)])
-    edges = '\n'.join([f"    {i+1} --> Outcome" for i in range(len(drivers))])
-    mermaid = f"```mermaid\nflowchart LR\n{nodes}\n    Outcome((Net Present Value))\n{edges}\n```"
-    return mermaid
+    return px.bar(
+        impact_df.sort_values("Impact"),
+        x="Impact",
+        y="Driver",
+        orientation="h",
+        title="Tornado Chart: Driver Impacts on NPV",
+    )
 
 
-def generate_narrative(findings):
+def generate_risk_mermaid(drivers: list[str]) -> str:
     """
-    Call OpenAI GPT to generate a report summary from findings dict.
+    Build a Mermaid flowchart snippet connecting each driver to a single outcome node.
+    """
+    lines = [f"    node{i}[{d}]" for i, d in enumerate(drivers, 1)]
+    lines.append("    Outcome((Net Present Value))")
+    lines += [f"    node{i} --> Outcome" for i in range(1, len(drivers) + 1)]
+    return "```mermaid\nflowchart LR\n" + "\n".join(lines) + "\n```"
+
+
+def generate_narrative(findings: dict) -> str:
+    """
+    Use OpenAI to produce a concise executive summary from findings.
     """
     prompt = (
         "Write a concise executive summary of the following risk analysis results:\n"
-        + json.dumps(findings)
+        + json.dumps(findings, indent=2)
     )
-    response = openai.Completion.create(
-        engine="text-davinci-003",
-        prompt=prompt,
-        max_tokens=250,
-        temperature=0.5
+    resp = openai.Completion.create(
+        engine="text-davinci-003", prompt=prompt, max_tokens=200, temperature=0.5
     )
-    return response.choices[0].text.strip()
+    text = resp.choices[0].text.strip()
+
+    # Strip any code fences
+    m = re.search(r"```(?:json)?(.*?)```", text, re.S)
+    return m.group(1).strip() if m else text
 
 
-def export_pdf(charts, narrative):
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial", size=12)
-    pdf.multi_cell(0, 10, narrative)
-    # TODO: embed charts as images
-    pdf.output("RiskSim360_Report.pdf")
-    st.success("PDF report generated: RiskSim360_Report.pdf")
+def export_pdf(
+    hist_fig: px.bar,
+    tor_fig: px.bar,
+    narrative: str,
+    summary_dict: dict
+) -> None:
+    """
+    Generate and stream a PDF containing narrative, summary stats, and charts.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        hpath = os.path.join(tmpdir, "hist.png")
+        tpath = os.path.join(tmpdir, "tornado.png")
+        hist_fig.write_image(hpath)
+        tor_fig.write_image(tpath)
+
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Arial", "B", 14)
+        pdf.cell(0, 10, "RiskSim360 Report", ln=True)
+        pdf.ln(5)
+
+        pdf.set_font("Arial", size=12)
+        pdf.multi_cell(0, 8, narrative or "No narrative available.")
+        pdf.ln(5)
+
+        for k, v in summary_dict.items():
+            pdf.cell(0, 8, f"{k}: {v}", ln=True)
+        pdf.ln(5)
+
+        pdf.image(hpath, w=180)
+        pdf.ln(5)
+        pdf.image(tpath, w=180)
+
+        out_path = os.path.join(tmpdir, "RiskSim360_Report.pdf")
+        pdf.output(out_path)
+
+        with open(out_path, "rb") as f:
+            st.download_button(
+                "📄 Download PDF Report",
+                f,
+                file_name="RiskSim360_Report.pdf",
+                mime="application/pdf"
+            )
 
 
+def export_excel(
+    sim_df: pd.DataFrame,
+    npv_array: np.ndarray,
+    assumptions_df: pd.DataFrame
+) -> None:
+    """
+    Generate and stream an Excel workbook with simulation data, NPVs, and assumptions.
+    """
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+        writer = pd.ExcelWriter(tmp.name, engine="xlsxwriter")
+        sim_df.to_excel(writer, sheet_name="Simulations", index=False)
+        pd.DataFrame({"NPV": npv_array}).to_excel(
+            writer, sheet_name="NPV Summary", index=False
+        )
+        assumptions_df.to_excel(writer, sheet_name="Assumptions", index=False)
+        writer.close()
+
+        with open(tmp.name, "rb") as f:
+            st.download_button(
+                "📊 Download Excel Workbook",
+                f,
+                file_name="RiskSim360_Output.xlsx",
+                mime=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                )
+            )
+
+
+# ── Main App ───────────────────────────────────────────────────────────────────
 def main():
     st.title("RiskSim360: Monte Carlo Risk Simulator")
+    st.sidebar.header("Inputs & Scenario Manager")
 
-    # Sidebar inputs
-    st.sidebar.header("Inputs & Settings")
-    uploaded = st.sidebar.file_uploader("Upload Assumptions (CSV)", type=["csv","xlsx"])
-    n_sims = st.sidebar.number_input("# Simulations", min_value=1000, max_value=100000, value=20000, step=1000)
-    discount_rate = st.sidebar.number_input("Discount Rate", min_value=0.0, max_value=1.0, value=0.1)
-    run_button = st.sidebar.button("Run Simulation")
+    # -- Structured Assumptions Upload --
+    uploaded = st.sidebar.file_uploader(
+        "Upload Assumptions (CSV/XLSX)", type=["csv", "xlsx"]
+    )
+    df_upload = None
+    if uploaded:
+        try:
+            df_upload = (
+                pd.read_csv(uploaded)
+                if uploaded.name.lower().endswith(".csv")
+                else pd.read_excel(uploaded)
+            )
+            st.sidebar.success("Assumptions file loaded.")
+        except Exception as e:
+            st.sidebar.error(f"Failed to load file: {e}")
 
-    if uploaded and run_button:
-        # Load data
-        if uploaded.name.endswith('.csv'):
-            df = pd.read_csv(uploaded)
-        else:
-            df = pd.read_excel(uploaded)
+    # -- Free-Text Parser --
+    free_text = st.sidebar.text_area(
+        "Or paste assumption text (e.g., 'Revenue growth 8 ± 3 %, COGS 55-60 %')",
+        height=100,
+    )
+    if st.sidebar.button("Parse Free-Text") and free_text:
+        prompt = (
+            "Parse the following financial assumptions into JSON array of objects "
+            "with keys: driver, distribution (triangular, normal, lognormal, uniform), "
+            "params [three numbers]:\n"
+            + free_text
+        )
+        resp = openai.Completion.create(
+            engine="text-davinci-003", prompt=prompt, max_tokens=300, temperature=0
+        )
+        raw = resp.choices[0].text.strip()
+        m = re.search(r"```(?:json)?(.*?)```", raw, re.S)
+        jstr = m.group(1).strip() if m else raw
+        try:
+            parsed = json.loads(jstr)
+            df_parsed = pd.json_normalize(parsed)
+            df_parsed.columns = [
+                "Driver",
+                "Distribution",
+                "Param1",
+                "Param2",
+                "Param3",
+            ]
+            st.sidebar.success("Parsed assumptions:")
+            st.sidebar.dataframe(df_parsed)
+            st.session_state["parsed_df"] = df_parsed
+        except Exception as e:
+            st.sidebar.error(f"Parsing failed: {e}")
 
-        assumptions = parse_assumptions(df)
-        sim_df = run_monte_carlo(assumptions, int(n_sims))
+    # -- Save Scenario --
+    scenario_name = st.sidebar.text_input("Scenario Name")
+    if st.sidebar.button("Save Scenario") and scenario_name:
+        if df_upload is not None:
+            st.session_state["scenarios"][scenario_name] = df_upload
+        elif st.session_state["parsed_df"] is not None:
+            st.session_state["scenarios"][scenario_name] = st.session_state[
+                "parsed_df"
+            ]
+        st.sidebar.success(f"Saved scenario '{scenario_name}'")
 
-        # Calculate NPV
-        # Assume cashflow drivers are named 'CF0','CF1',... etc
-        cf_cols = [d['driver'] for d in assumptions]
-        npv_series = calculate_npv(sim_df, cf_cols, discount_rate)
+    scenarios = list(st.session_state["scenarios"].keys())
+    selected = st.sidebar.selectbox("Select Scenario", scenarios) if scenarios else None
 
-        # Display histogram
-        fig = px.histogram(npv_series, nbins=50, title="NPV Distribution")
-        st.plotly_chart(fig, use_container_width=True)
+    # -- Simulation Settings --
+    n_sims = st.sidebar.number_input(
+        "Number of Simulations", min_value=1000, max_value=100000, value=20000, step=1000
+    )
+    discount_rate = st.sidebar.number_input(
+        "Discount Rate", min_value=0.0, max_value=1.0, value=0.1, step=0.01
+    )
 
-        # Tornado chart: compute driver impacts
+    # -- Optional Correlation Matrix --
+    corr_matrix = None
+    uploaded_corr = st.sidebar.file_uploader(
+        "Upload Correlation Matrix (CSV)", type="csv"
+    )
+    if uploaded_corr:
+        try:
+            corr_df = pd.read_csv(uploaded_corr, index_col=0)
+            if (
+                corr_df.shape[0] != corr_df.shape[1]
+                or list(corr_df.columns) != list(corr_df.index)
+            ):
+                raise ValueError("Matrix must be square with matching row/column names.")
+            if np.any(np.linalg.eigvals(corr_df) < 0):
+                raise ValueError("Matrix must be positive semi-definite.")
+            corr_matrix = corr_df.values
+            st.sidebar.success("Correlation matrix loaded.")
+        except Exception as e:
+            st.sidebar.error(f"Invalid correlation matrix: {e}")
+
+    # -- Run Simulation --
+    if selected and st.sidebar.button("Run Simulation"):
+        df_assump = st.session_state["scenarios"][selected]
+        assumptions = parse_assumptions_df(df_assump)
+        sim_df = run_monte_carlo(assumptions, int(n_sims), corr_matrix)
+
+        drivers = [a["driver"] for a in assumptions]
+        npv_arr = calculate_npv(sim_df, drivers, discount_rate)
+        var, cvar = calculate_var_cvar(npv_arr)
+        base_npv = npv_arr.mean()
+
+        st.subheader(f"Scenario: {selected}")
+
+        # NPV distribution
+        hist_fig = px.histogram(npv_arr, nbins=50, title="NPV Distribution")
+        st.plotly_chart(hist_fig, use_container_width=True)
+
+        # Tornado chart
         impacts = []
-        base_npv = npv_series.mean()
-        for driver in cf_cols:
-            # perturb each driver by +/- 1 std dev
+        for d in drivers:
             pert = sim_df.copy()
-            pert[driver] += sim_df[driver].std()
-            pert_npv = calculate_npv(pert, cf_cols, discount_rate)
-            impacts.append({'Driver': driver, 'Impact': (pert_npv.mean() - base_npv)})
-        impact_df = pd.DataFrame(impacts)
-        tornado_fig = tornado_chart(impact_df)
-        st.plotly_chart(tornado_fig, use_container_width=True)
+            pert[d] += sim_df[d].std()
+            impacts.append({
+                "Driver": d,
+                "Impact": calculate_npv(pert, drivers, discount_rate).mean() - base_npv,
+            })
+        tor_df = pd.DataFrame(impacts)
+        tor_fig = tornado_chart(tor_df)
+        st.plotly_chart(tor_fig, use_container_width=True)
 
-        # Mermaid risk workflow text
-        mermaid_md = generate_risk_mermaid(cf_cols)
+        # Risk metrics
+        st.markdown(
+            f"**VaR (5%):** ${var:,.2f}   "
+            f"**CVaR:** ${cvar:,.2f}   "
+            f"**P(NPV<0):** {(npv_arr < 0).mean() * 100:.2f}%"
+        )
+
+        # Mermaid risk workflow
         st.markdown("### Risk Workflow Diagram")
-        st.code(mermaid_md, language='markdown')
-
-        # Optional: send mermaid to Flowwmaid via API (not implemented)
-        if st.checkbox("Send to Flowwmaid for visualization"): 
-            st.info("Feature coming soon: integration with Flowwmaid API...")
+        st.code(generate_risk_mermaid(drivers), language="markdown")
 
         # AI narrative
-        if st.checkbox("Generate AI Narrative"): 
+        narrative = ""
+        if st.checkbox("Generate AI Narrative"):
             findings = {
-                'Base NPV': round(base_npv,2),
-                'Mean NPV': round(npv_series.mean(),2),
-                'Std NPV': round(npv_series.std(),2),
-                'Probability NPV < 0': round((npv_series<0).mean()*100,2)
+                "Scenario": selected,
+                "Mean NPV": round(base_npv, 2),
+                "Std Dev": round(npv_arr.std(), 2),
+                "VaR(5%)": round(var, 2),
+                "CVaR": round(cvar, 2),
+                "P(NPV<0)": f"{(npv_arr < 0).mean() * 100:.2f}%",
             }
             narrative = generate_narrative(findings)
             st.subheader("Executive Summary")
             st.write(narrative)
 
-        # Export
-        if st.button("Export Report as PDF"): 
-            export_pdf([fig, tornado_fig], narrative if 'narrative' in locals() else "")
+        # Interactive “what-if” sliders
+        st.markdown("### 🔁 Re-run With Adjusted Inputs")
+        adj_vals = {}
+        for d in drivers:
+            mean_val = sim_df[d].mean()
+            sd = sim_df[d].std()
+            adj_vals[d] = st.slider(
+                d, float(mean_val - 2 * sd), float(mean_val + 2 * sd),
+                float(mean_val), step=float(sd / 10)
+            )
+        adj_df = pd.DataFrame([adj_vals])
+        adj_npv = calculate_npv(adj_df, drivers, discount_rate)[0]
+        st.markdown(
+            f"**Adjusted NPV:** ${adj_npv:,.2f}   "
+            f"**Δ:** ${adj_npv - base_npv:,.2f}"
+        )
+
+        # Export buttons
+        st.markdown("### Export Results")
+        summary_dict = {
+            "Mean NPV": f"${base_npv:,.2f}",
+            "Std Dev": f"${npv_arr.std():,.2f}",
+            "VaR(5%)": f"${var:,.2f}",
+            "CVaR": f"${cvar:,.2f}",
+            "P(NPV<0)": f"{(npv_arr < 0).mean() * 100:.2f}%",
+        }
+        export_pdf(hist_fig, tor_fig, narrative, summary_dict)
+        export_excel(sim_df, npv_arr, df_assump)
+
 
 if __name__ == "__main__":
     main()
-
