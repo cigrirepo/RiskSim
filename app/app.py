@@ -38,7 +38,6 @@ if "scenarios" not in st.session_state:
 if "parsed_df" not in st.session_state:
     st.session_state["parsed_df"] = None
 
-
 # ── Helper Functions ──────────────────────────────────────────────────────────
 def parse_assumptions_df(df: pd.DataFrame) -> list[dict]:
     """
@@ -77,7 +76,6 @@ def sample_from_copula(corr_normals: np.ndarray, assumptions: list) -> np.ndarra
         q = stats.norm.cdf(corr_normals[:, i])
         mn, p2, p3 = a["params"]
         dist = a["dist"]
-
         if dist == "triangular":
             mode, mx = p2, p3
             c = (mode - mn) / (mx - mn)
@@ -90,7 +88,6 @@ def sample_from_copula(corr_normals: np.ndarray, assumptions: list) -> np.ndarra
             samples[:, i] = stats.uniform(loc=mn, scale=(p2 - mn)).ppf(q)
         else:
             samples[:, i] = np.nan
-
     return samples
 
 
@@ -111,7 +108,6 @@ def run_monte_carlo(
         for i, a in enumerate(assumptions):
             mn, p2, p3 = a["params"]
             dist = a["dist"]
-
             if dist == "triangular":
                 mode, mx = p2, p3
                 c = (mode - mn) / (mx - mn)
@@ -124,7 +120,6 @@ def run_monte_carlo(
                 sims[:, i] = stats.uniform(loc=mn, scale=(p2 - mn)).rvs(n_sims)
             else:
                 sims[:, i] = np.nan
-
     cols = [a["driver"] for a in assumptions]
     return pd.DataFrame(sims, columns=cols)
 
@@ -158,10 +153,8 @@ def tornado_chart(impact_df: pd.DataFrame) -> px.bar:
     """
     return px.bar(
         impact_df.sort_values("Impact"),
-        x="Impact",
-        y="Driver",
-        orientation="h",
-        title="Tornado Chart: Driver Impacts on NPV",
+        x="Impact", y="Driver", orientation="h",
+        title="Tornado Chart: Driver Impacts on NPV"
     )
 
 
@@ -190,8 +183,6 @@ def generate_narrative(findings: dict) -> str:
         temperature=0.5,
     )
     text = resp.choices[0].message.content.strip()
-
-    # Strip any code fences
     m = re.search(r"```(?:json)?(.*?)```", text, re.S)
     return m.group(1).strip() if m else text
 
@@ -231,13 +222,10 @@ def export_pdf(
 
         out_path = os.path.join(tmpdir, "RiskSim360_Report.pdf")
         pdf.output(out_path)
-
         with open(out_path, "rb") as f:
             st.download_button(
-                "📄 Download PDF Report",
-                f,
-                file_name="RiskSim360_Report.pdf",
-                mime="application/pdf"
+                "📄 Download PDF Report", f,
+                file_name="RiskSim360_Report.pdf", mime="application/pdf"
             )
 
 
@@ -250,25 +238,16 @@ def export_excel(
     Generate and stream an Excel workbook with simulation data, NPVs, and assumptions.
     """
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
-        writer = pd.ExcelWriter(tmp.name, engine="xlsxwriter")
-        sim_df.to_excel(writer, sheet_name="Simulations", index=False)
-        pd.DataFrame({"NPV": npv_array}).to_excel(
-            writer, sheet_name="NPV Summary", index=False
-        )
-        assumptions_df.to_excel(writer, sheet_name="Assumptions", index=False)
+        writer = pd.ExcelWriter(tmp.name, engine='xlsxwriter')
+        sim_df.to_excel(writer, sheet_name='Simulations', index=False)
+        pd.DataFrame({'NPV': npv_array}).to_excel(writer, sheet_name='NPV Summary', index=False)
+        assumptions_df.to_excel(writer, sheet_name='Assumptions', index=False)
         writer.close()
-
         with open(tmp.name, "rb") as f:
             st.download_button(
-                "📊 Download Excel Workbook",
-                f,
-                file_name="RiskSim360_Output.xlsx",
-                mime=(
-                    "application/vnd.openxmlformats-officedocument."
-                    "spreadsheetml.sheet"
-                )
+                "📊 Download Excel Workbook", f,
+                file_name="RiskSim360_Output.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
-
 
 # ── Main App ───────────────────────────────────────────────────────────────────
 def main():
@@ -300,8 +279,7 @@ def main():
         prompt = (
             "Parse the following financial assumptions into JSON array of objects "
             "with keys: driver, distribution (triangular, normal, lognormal, uniform), "
-            "params [three numbers]:\n"
-            + free_text
+            "params [three numbers]:\n" + free_text
         )
         resp = openai.chat.completions.create(
             model="gpt-3.5-turbo",
@@ -315,13 +293,7 @@ def main():
         try:
             parsed = json.loads(jstr)
             df_parsed = pd.json_normalize(parsed)
-            df_parsed.columns = [
-                "Driver",
-                "Distribution",
-                "Param1",
-                "Param2",
-                "Param3",
-            ]
+            df_parsed.columns = ["Driver", "Distribution", "Param1", "Param2", "Param3"]
             st.sidebar.success("Parsed assumptions:")
             st.sidebar.dataframe(df_parsed)
             st.session_state["parsed_df"] = df_parsed
@@ -334,9 +306,7 @@ def main():
         if df_upload is not None:
             st.session_state["scenarios"][scenario_name] = df_upload
         elif st.session_state["parsed_df"] is not None:
-            st.session_state["scenarios"][scenario_name] = st.session_state[
-                "parsed_df"
-            ]
+            st.session_state["scenarios"][scenario_name] = st.session_state["parsed_df"]
         st.sidebar.success(f"Saved scenario '{scenario_name}'")
 
     scenarios = list(st.session_state["scenarios"].keys())
@@ -358,10 +328,7 @@ def main():
     if uploaded_corr:
         try:
             corr_df = pd.read_csv(uploaded_corr, index_col=0)
-            if (
-                corr_df.shape[0] != corr_df.shape[1]
-                or list(corr_df.columns) != list(corr_df.index)
-            ):
+            if corr_df.shape[0] != corr_df.shape[1] or list(corr_df.columns) != list(corr_df.index):
                 raise ValueError("Matrix must be square with matching row/column names.")
             if np.any(np.linalg.eigvals(corr_df) < 0):
                 raise ValueError("Matrix must be positive semi-definite.")
@@ -402,8 +369,9 @@ def main():
 
         # Risk metrics
         st.markdown(
-            f"**VaR (5%):** ${var:.,.2f}   "
-            f"**CVaR:** ${cvar:.,.2f}"
+            f"**VaR (5%):** ${var:,.2f}   "
+            f"**CVaR:** ${cvar:,.2f}   "
+            f"**P(NPV<0):** {(npv_arr < 0).mean() * 100:.2f}%"
         )
 
         # Mermaid risk workflow
