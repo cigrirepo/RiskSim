@@ -3,10 +3,7 @@ pandas
 numpy
 scipy
 plotly
+kaleido
 openai
 fpdf
-xlsxwriter
-numba
-python-docx
-request
-matplotlib
+XlsxWriter
