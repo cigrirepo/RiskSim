@@ -1,4 +1,4 @@
-import os
+import os 
 import re
 import json
 import tempfile
@@ -170,11 +170,10 @@ def generate_risk_mermaid(drivers: list[str]) -> str:
     lines = [f"    node{i}[{d}]" for i, d in enumerate(drivers, 1)]
     lines.append("    Outcome((Net Present Value))")
     lines += [f"    node{i} --> Outcome" for i in range(1, len(drivers) + 1)]
-    return "```mermaid
-flowchart LR
-" + "
-".join(lines) + "
-```"
+    return "```mermaid\nflowchart LR\n" + "\n".join(lines) + "\n```"
+
+# ... rest of code unchanged ...
+
 
 
 def generate_narrative(findings: dict) -> str:
