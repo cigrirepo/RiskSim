@@ -183,7 +183,7 @@ def generate_narrative(findings: dict) -> str:
         "Write a concise executive summary of the following risk analysis results:\n"
         + json.dumps(findings, indent=2)
     )
-    resp = openai.ChatCompletion.create(
+    resp = openai.chat.completions.create(
         model="gpt-3.5-turbo",
         messages=[{"role": "user", "content": prompt}],
         max_tokens=200,
@@ -303,7 +303,7 @@ def main():
             "params [three numbers]:\n"
             + free_text
         )
-        resp = openai.ChatCompletion.create(
+        resp = openai.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=300,
@@ -402,9 +402,8 @@ def main():
 
         # Risk metrics
         st.markdown(
-            f"**VaR (5%):** ${var:,.2f}   "
-            f"**CVaR:** ${cvar:,.2f}   "
-            f"**P(NPV<0):** {(npv_arr < 0).mean() * 100:.2f}%"
+            f"**VaR (5%):** ${var:.,.2f}   "
+            f"**CVaR:** ${cvar:.,.2f}"
         )
 
         # Mermaid risk workflow
